@@ -1,2 +1,2 @@
 # fda_snitch
-Package that enables wifi-access monitoring
+Package that enables monitoring wifi-access
