@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="fda_snitch",
-    version="0.1.4",
-    description="FDA Snitch package ",
+    version="0.2.0",
+    description="Tamper-evident exam-integrity monitor: connectivity and clipboard logging with a verifiable hash chain",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Casper Kaandorp",
