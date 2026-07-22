@@ -1,12 +1,12 @@
 import hashlib
-import pkg_resources
+import os
+import platform
 import sqlite3
+import socket
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-import simpleaudio as sa
 
 create_table = """
     CREATE TABLE IF NOT EXISTS logs (
@@ -19,23 +19,16 @@ create_table = """
 class Snitch:
     def __init__(
             self,
-            sleep=2,
+            sleep=1,
             database_path=None,
             url=None,
-            with_sound=True,
-            repeat_sound=2):
+            with_sound=True):
         
         conn = None
         self.sleep = sleep
         self.uri = "./log.sqlite" if database_path is None else database_path
-        self.url = "https://google.com" if url is None else url
-        self.last_ping = None
+        self.url = "www.google.com" if url is None else url
         self.with_sound = with_sound
-        self.repeat_sound = 2 if not(isinstance(repeat_sound, int)) else repeat_sound
-
-        # load sound file
-        path = pkg_resources.resource_filename(__name__, "assets/censor-beep-2.wav")
-        self.sound = sa.WaveObject.from_wave_file(path)
 
         try:
             conn, cursor = self._connect_db()
@@ -50,16 +43,22 @@ class Snitch:
 
     def _ping(self):
         try:
-            response = urllib.request.urlopen(self.url)
-            response.read() # probably not necessary
+            socket.create_connection((self.url, 80), timeout=5)
             return True
-        except urllib.error.URLError:
-            return False
-        except Exception:
+        except OSError:
             return False
 
+    def beep(self):
+        if platform.system() == 'Windows':
+            import winsound
+            winsound.Beep(1000, 500)  # Frequency, Duration in ms
+        elif platform.system() == 'Darwin':  # macOS
+            os.system('afplay /System/Library/Sounds/Ping.aiff')
+        
     def run_snitch(self):
         conn, cursor = self._connect_db()
+        last_ping = None
+
         while(True):
             
             # create hash of file
@@ -70,20 +69,21 @@ class Snitch:
             now = datetime.now()
 
             # try to reach out to google.nl
-            connected = int(self._ping())
+            connected = self._ping()
 
-            if self.last_ping is None:
-                self.last_ping = connected
+            if last_ping is None:
+                last_ping = connected
 
-            if connected != self.last_ping and self.with_sound:
-                # play sound
-                for _ in range(self.repeat_sound):
-                    playing = self.sound.play()
-                    playing.wait_done()
-                    time.sleep(0.5)
-
+            if connected != last_ping and self.with_sound:
+                try:
+                    # beep twice
+                    self.beep()
+                    self.beep()
+                finally:
+                    pass
+                
             # reset
-            self.last_ping = connected
+            last_ping = connected
 
             # inject in database
             cursor.execute(f"""

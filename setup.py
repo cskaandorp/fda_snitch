@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="fda_snitch",
-    version="0.1.2",
+    version="0.1.4",
     description="FDA Snitch package ",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -11,11 +11,8 @@ setup(
     author_email="casper@compunist.nl",
     packages=find_packages(),
     include_package_data=True,
-    package_data={
-        "fda_snitch": ["assets/*.wav"],
-    },
     install_requires=[
-        "simpleaudio"
+        
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
