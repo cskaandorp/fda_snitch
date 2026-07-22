@@ -1,6 +1,7 @@
 import hashlib
 import os
 import platform
+import re
 import sqlite3
 import socket
 import time
@@ -17,6 +18,13 @@ create_table = """
         hash text,
         prev_chain text,
         chain text
+    ); """
+
+# Per-student metadata (name, etc.). Keeps the log tied to a person.
+create_meta = """
+    CREATE TABLE IF NOT EXISTS meta (
+        key text PRIMARY KEY,
+        value text
     ); """
 
 # Columns added after the first release. Existing databases created by
@@ -37,22 +45,60 @@ class Snitch:
             sleep=1,
             database_path=None,
             url=None,
-            with_sound=True):
+            with_sound=True,
+            student=None):
+
+        # Ask who is being monitored before anything starts. Blank -> "anon",
+        # so a skipped prompt never stops the exam from beginning.
+        if student is None:
+            try:
+                student = input("Student name: ")
+            except EOFError:
+                student = ""
+        self.student = (student or "").strip()
+        self.slug = self._slug(self.student)
+        # The whole chain hangs off a name-derived root, so every row transitively
+        # depends on the student's identity: change the name and the chain breaks.
+        self.root = self._root(self.student)
 
         conn = None
         self.sleep = sleep
-        self.uri = "./log.sqlite" if database_path is None else database_path
+        # Personalise the database name so each student gets their own file.
+        self.uri = f"./log_{self.slug}.sqlite" if database_path is None else database_path
         self.url = "www.google.com" if url is None else url
         self.with_sound = with_sound
 
         try:
             conn, cursor = self._connect_db()
             cursor.execute(create_table)
+            cursor.execute(create_meta)
             self._migrate(cursor)
+            # First writer wins: preserve the identity the log was created with
+            # even if a later run supplies a different name for the same file.
+            cursor.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('student', ?)",
+                (self.student,),
+            )
             conn.commit()
         finally:
             if conn:
                 conn.close()
+
+        print(f"[fda_snitch] monitoring active for "
+              f"{self.student or 'anon'} -> {self.uri}")
+
+    @staticmethod
+    def _slug(name):
+        # Filesystem-safe, lower-case handle for the database filename.
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", (name or "").strip()).strip("_").lower()
+        return slug or "anon"
+
+    @staticmethod
+    def _root(student):
+        # Chain anchor derived from the student's name (replaces the generic
+        # GENESIS seed). Empty name still yields a stable, name-bound root.
+        seed = "fda_snitch:" + (student or "").strip()
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _connect_db(self):
         conn = sqlite3.connect(self.uri)
@@ -80,18 +126,31 @@ class Snitch:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @classmethod
-    def verify(cls, database_path):
+    def verify(cls, database_path, student=None):
         """Walk the hash chain in a log database and report the first break.
 
+        Pass ``student`` to assert whose log this should be: the chain is then
+        re-rooted from that name, so a log swapped in from another student (or
+        stripped of its identity) fails at the very first row.
+
         Returns a dict:
-            ok    -- True only if the chain is intact and seqs are contiguous
-            rows  -- number of chained rows checked
-            error -- None, or a human-readable description of the first problem
-            seq   -- seq of the first problem row (None if ok)
-            gaps  -- list of missing seq numbers (i.e. deleted rows)
+            ok      -- True only if the chain is intact and seqs are contiguous
+            rows    -- number of chained rows checked
+            error   -- None, or a human-readable description of the first problem
+            seq     -- seq of the first problem row (None if ok)
+            gaps    -- list of missing seq numbers (i.e. deleted rows)
+            student -- the name stored in the log (None for legacy logs)
         """
         conn = sqlite3.connect(database_path)
         try:
+            stored = None
+            try:
+                r = conn.execute(
+                    "SELECT value FROM meta WHERE key='student'"
+                ).fetchone()
+                stored = r[0] if r else None
+            except sqlite3.OperationalError:
+                stored = None  # legacy log without a meta table
             rows = conn.execute(
                 "SELECT seq, timestamp, connected, hash, prev_chain, chain "
                 "FROM logs WHERE seq IS NOT NULL ORDER BY id"
@@ -100,13 +159,25 @@ class Snitch:
             conn.close()
 
         result = {"ok": False, "rows": len(rows), "error": None,
-                  "seq": None, "gaps": []}
+                  "seq": None, "gaps": [], "student": stored}
+
+        # Caller asserted a name that disagrees with the log's own record.
+        if (student is not None and stored is not None
+                and student.strip() != stored.strip()):
+            result["error"] = (f"student mismatch: log is for {stored!r}, "
+                               f"expected {student!r}")
+            return result
+
+        # Which identity roots the chain? Prefer the asserted name, then the
+        # stored one; fall back to the generic seed for pre-identity logs.
+        identity = student if student is not None else stored
+        root = cls._root(identity) if identity is not None else GENESIS
 
         if not rows:
             result["error"] = "no chained rows found (empty or pre-chain log)"
             return result
 
-        prev_chain = GENESIS
+        prev_chain = root
         expected_seq = None
         for seq, timestamp, connected, src_hash, stored_prev, stored_chain in rows:
             # linkage: this row must point at the previous row's chain value
@@ -145,8 +216,8 @@ class Snitch:
         except sqlite3.OperationalError:
             row = None
         if row and row[0] is not None:
-            return row[0], row[1] or GENESIS
-        return 0, GENESIS
+            return row[0], row[1] or self.root
+        return 0, self.root
 
     def _ping(self):
         try:
