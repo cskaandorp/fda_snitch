@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import platform
 import re
@@ -51,7 +52,16 @@ class Snitch:
             database_path=None,
             url=None,
             with_sound=True,
-            student=None):
+            student=None,
+            secret=None):
+
+        # Optional proctor-held key. When set (here or via FDA_SNITCH_KEY), each
+        # chain link is an HMAC instead of a plain hash, so a student who knows
+        # this open-source algorithm still cannot forge a consistent chain
+        # without the key. Left unset, the tool behaves exactly as before.
+        if secret is None:
+            secret = os.environ.get("FDA_SNITCH_KEY")
+        self.secret = secret.encode("utf-8") if isinstance(secret, str) else secret
 
         # Ask who is being monitored before anything starts. Blank -> "anon",
         # so a skipped prompt never stops the exam from beginning.
@@ -94,6 +104,14 @@ class Snitch:
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('code_hash', ?)",
                 (self.code_hash,),
             )
+            # Record a key-check (an HMAC of a fixed string) so verify() can tell
+            # "wrong key" apart from "tampered", and detect a keyed log whose key
+            # binding was stripped. It reveals nothing about the key itself.
+            if self.secret:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('key_check', ?)",
+                    (self._key_check(self.secret),),
+                )
             conn.commit()
         finally:
             if conn:
@@ -138,10 +156,13 @@ class Snitch:
                 cursor.execute(f"ALTER TABLE logs ADD COLUMN {name} {coltype}")
 
     @staticmethod
-    def _chain(seq, timestamp, connected, src_hash, clip_hash, clip_len, prev_chain):
+    def _chain(seq, timestamp, connected, src_hash, clip_hash, clip_len,
+               prev_chain, key=None):
         # Tamper-evident chain: each row commits to the row before it, so a
         # changed, deleted, or truncated row breaks every following chain value.
         # Static so verify() reuses the exact same computation as run_snitch().
+        # With a key, the link is an HMAC (unforgeable without the key); without
+        # one, a plain SHA-256 (detects casual tampering only).
         payload = "|".join([
             str(seq),
             timestamp,
@@ -150,8 +171,16 @@ class Snitch:
             clip_hash or "",
             "" if clip_len is None else str(int(clip_len)),
             prev_chain,
-        ])
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        ]).encode("utf-8")
+        if key:
+            return hmac.new(key, payload, hashlib.sha256).hexdigest()
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _key_check(key):
+        # A stable HMAC over a fixed label, stored in meta so verify() can
+        # recognise the correct key without the key ever being written down.
+        return hmac.new(key, b"fda_snitch-key-check", hashlib.sha256).hexdigest()
 
     def _read_clipboard(self):
         # Return the current clipboard text, or None if empty, non-text, or
@@ -207,7 +236,8 @@ class Snitch:
             user32.CloseClipboard()
 
     @classmethod
-    def verify(cls, database_path, student=None, expected_code_hash=None):
+    def verify(cls, database_path, student=None, expected_code_hash=None,
+               secret=None):
         """Walk the hash chain in a log database and report the first break.
 
         Pass ``student`` to assert whose log this should be, and/or
@@ -215,6 +245,10 @@ class Snitch:
         re-rooted from those values, so a log swapped in from another student,
         stripped of its identity, or produced by modified code fails at the
         very first row.
+
+        Pass ``secret`` (or set FDA_SNITCH_KEY) for logs recorded with a key:
+        the chain is then checked as an HMAC. A wrong key is reported distinctly
+        from tampering, and a keyed log whose key binding was stripped is flagged.
 
         Returns a dict:
             ok        -- True only if the chain is intact and seqs are contiguous
@@ -224,17 +258,23 @@ class Snitch:
             gaps      -- list of missing seq numbers (i.e. deleted rows)
             student   -- the name stored in the log (None for legacy logs)
             code_hash -- the code fingerprint stored in the log (None if absent)
+            keyed     -- True if the log carries a key binding (HMAC chain)
         """
+        if secret is None:
+            secret = os.environ.get("FDA_SNITCH_KEY")
+        key = secret.encode("utf-8") if isinstance(secret, str) else secret
+
         conn = sqlite3.connect(database_path)
         try:
-            stored, stored_code = None, None
+            stored, stored_code, key_check = None, None, None
             try:
                 meta = dict(conn.execute(
                     "SELECT key, value FROM meta "
-                    "WHERE key IN ('student', 'code_hash')"
+                    "WHERE key IN ('student', 'code_hash', 'key_check')"
                 ).fetchall())
                 stored = meta.get('student')
                 stored_code = meta.get('code_hash')
+                key_check = meta.get('key_check')
             except sqlite3.OperationalError:
                 pass  # legacy log without a meta table
             rows = conn.execute(
@@ -245,7 +285,26 @@ class Snitch:
             conn.close()
 
         result = {"ok": False, "rows": len(rows), "error": None, "seq": None,
-                  "gaps": [], "student": stored, "code_hash": stored_code}
+                  "gaps": [], "student": stored, "code_hash": stored_code,
+                  "keyed": key_check is not None}
+
+        # Reconcile the key with what the log expects, before anything else.
+        if key_check is not None:
+            # Log was keyed: a secret is required and must match.
+            if key is None:
+                result["error"] = "log is keyed; pass secret= (or set FDA_SNITCH_KEY)"
+                return result
+            if not hmac.compare_digest(cls._key_check(key), key_check):
+                result["error"] = "wrong secret (key does not match this log)"
+                return result
+        else:
+            # No key binding. If the caller supplied a secret they expected one,
+            # so a missing binding is suspicious (e.g. it was stripped out).
+            if key is not None:
+                result["error"] = ("log carries no key binding, but a secret was "
+                                   "provided: it was never keyed or the binding "
+                                   "was removed")
+                return result
 
         # Caller asserted a name that disagrees with the log's own record.
         if (student is not None and stored is not None
@@ -286,7 +345,7 @@ class Snitch:
                 return result
             # recompute: the row's own fields must reproduce its chain value
             if cls._chain(seq, timestamp, connected, src_hash, clip_hash,
-                          clip_len, stored_prev) != stored_chain:
+                          clip_len, stored_prev, key) != stored_chain:
                 result["error"] = "chain hash mismatch (row contents altered)"
                 result["seq"] = seq
                 return result
@@ -402,7 +461,7 @@ class Snitch:
 
                 # link this row to the previous one
                 chain = self._chain(next_seq, now, connected, src_hash,
-                                    clip_hash, clip_len, prev_chain)
+                                    clip_hash, clip_len, prev_chain, self.secret)
 
                 # inject in database
                 cursor.execute(
