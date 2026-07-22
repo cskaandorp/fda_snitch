@@ -86,11 +86,13 @@ class Snitch:
             last_ping = connected
 
             # inject in database
-            cursor.execute(f"""
+            cursor.execute(
+                """
                 INSERT INTO logs (timestamp, connected, hash)
-                VALUES 
-                ('{now}', {connected}, '{hash}')
-                """)
+                VALUES (?, ?, ?)
+                """,
+                (now, int(connected), hash),
+            )
             conn.commit()
 
             time.sleep(self.sleep)
