@@ -4,6 +4,7 @@ import platform
 import re
 import sqlite3
 import socket
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ create_table = """
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         connected integer,
         hash text,
+        clip_hash text,
+        clip_len integer,
         prev_chain text,
         chain text
     ); """
@@ -34,6 +37,8 @@ migrations = {
     "seq": "integer",
     "prev_chain": "text",
     "chain": "text",
+    "clip_hash": "text",
+    "clip_len": "integer",
 }
 
 # Anchor value for the very first row of a chain.
@@ -112,7 +117,7 @@ class Snitch:
                 cursor.execute(f"ALTER TABLE logs ADD COLUMN {name} {coltype}")
 
     @staticmethod
-    def _chain(seq, timestamp, connected, src_hash, prev_chain):
+    def _chain(seq, timestamp, connected, src_hash, clip_hash, clip_len, prev_chain):
         # Tamper-evident chain: each row commits to the row before it, so a
         # changed, deleted, or truncated row breaks every following chain value.
         # Static so verify() reuses the exact same computation as run_snitch().
@@ -121,9 +126,64 @@ class Snitch:
             timestamp,
             str(int(connected)),
             src_hash,
+            clip_hash or "",
+            "" if clip_len is None else str(int(clip_len)),
             prev_chain,
         ])
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _read_clipboard(self):
+        # Return the current clipboard text, or None if empty, non-text, or
+        # unavailable. Dependency-free and native per platform: pbpaste on
+        # macOS, a small ctypes call on Windows (avoiding a ~500ms powershell
+        # spawn every tick). The caller only ever hashes this — the content
+        # itself is never stored.
+        system = platform.system()
+        try:
+            if system == 'Darwin':
+                out = subprocess.run(
+                    ['pbpaste'], capture_output=True, timeout=5)
+                if out.returncode != 0:
+                    return None
+                text = out.stdout.decode('utf-8', 'replace')
+                return text or None
+            elif system == 'Windows':
+                return self._win_clipboard()
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _win_clipboard():
+        # Read CF_UNICODETEXT from the Windows clipboard via ctypes. restypes
+        # are set to c_void_p so 64-bit HANDLEs are not truncated. Returns None
+        # if the clipboard is busy, empty, or holds non-text (e.g. an image).
+        import ctypes
+        CF_UNICODETEXT = 13
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        if not user32.OpenClipboard(0):
+            return None
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return None
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                return None
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                return None
+            try:
+                text = ctypes.c_wchar_p(ptr).value
+            finally:
+                kernel32.GlobalUnlock(handle)
+            return text or None
+        finally:
+            user32.CloseClipboard()
 
     @classmethod
     def verify(cls, database_path, student=None):
@@ -152,8 +212,8 @@ class Snitch:
             except sqlite3.OperationalError:
                 stored = None  # legacy log without a meta table
             rows = conn.execute(
-                "SELECT seq, timestamp, connected, hash, prev_chain, chain "
-                "FROM logs WHERE seq IS NOT NULL ORDER BY id"
+                "SELECT seq, timestamp, connected, hash, clip_hash, clip_len, "
+                "prev_chain, chain FROM logs WHERE seq IS NOT NULL ORDER BY id"
             ).fetchall()
         finally:
             conn.close()
@@ -179,7 +239,8 @@ class Snitch:
 
         prev_chain = root
         expected_seq = None
-        for seq, timestamp, connected, src_hash, stored_prev, stored_chain in rows:
+        for (seq, timestamp, connected, src_hash, clip_hash, clip_len,
+                stored_prev, stored_chain) in rows:
             # linkage: this row must point at the previous row's chain value
             if stored_prev != prev_chain:
                 result["error"] = ("chain link broken (row edited, reordered, "
@@ -187,7 +248,8 @@ class Snitch:
                 result["seq"] = seq
                 return result
             # recompute: the row's own fields must reproduce its chain value
-            if cls._chain(seq, timestamp, connected, src_hash, stored_prev) != stored_chain:
+            if cls._chain(seq, timestamp, connected, src_hash, clip_hash,
+                          clip_len, stored_prev) != stored_chain:
                 result["error"] = "chain hash mismatch (row contents altered)"
                 result["seq"] = seq
                 return result
@@ -237,6 +299,7 @@ class Snitch:
         conn, cursor = self._connect_db()
         seq, prev_chain = self._load_chain_state(cursor)
         last_ping = None
+        last_clip_hash = None
 
         while(True):
 
@@ -271,16 +334,34 @@ class Snitch:
                 # reset
                 last_ping = connected
 
+                # detect new clipboard contents. We record only a hash and a
+                # length when the clipboard *changes* since the previous tick,
+                # never the content itself. A cleared clipboard resets the
+                # baseline so re-copying the same text is logged again.
+                clip_hash = None
+                clip_len = None
+                clip = self._read_clipboard()
+                if clip is not None:
+                    h = hashlib.sha256(clip.encode("utf-8")).hexdigest()
+                    if h != last_clip_hash:
+                        clip_hash = h
+                        clip_len = len(clip)
+                    last_clip_hash = h
+                else:
+                    last_clip_hash = None
+
                 # link this row to the previous one
-                chain = self._chain(next_seq, now, connected, src_hash, prev_chain)
+                chain = self._chain(next_seq, now, connected, src_hash,
+                                    clip_hash, clip_len, prev_chain)
 
                 # inject in database
                 cursor.execute(
                     """
-                    INSERT INTO logs (seq, timestamp, connected, hash, prev_chain, chain)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO logs (seq, timestamp, connected, hash, clip_hash, clip_len, prev_chain, chain)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (next_seq, now, int(connected), src_hash, prev_chain, chain),
+                    (next_seq, now, int(connected), src_hash,
+                     clip_hash, clip_len, prev_chain, chain),
                 )
                 conn.commit()
 
