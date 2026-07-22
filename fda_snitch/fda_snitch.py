@@ -6,7 +6,7 @@ import sqlite3
 import socket
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -62,9 +62,14 @@ class Snitch:
                 student = ""
         self.student = (student or "").strip()
         self.slug = self._slug(self.student)
-        # The whole chain hangs off a name-derived root, so every row transitively
-        # depends on the student's identity: change the name and the chain breaks.
-        self.root = self._root(self.student)
+        # Fingerprint the monitoring code once, at start-up. It cannot change
+        # for the life of a run (the module is already loaded), so there is no
+        # reason to re-read it every tick.
+        self.code_hash = self._hash_source()
+        # The whole chain hangs off a root derived from BOTH the student's name
+        # and the code fingerprint, so every row transitively commits to the
+        # identity and the code version: change either and the chain breaks.
+        self.root = self._root(self.student, self.code_hash)
 
         conn = None
         self.sleep = sleep
@@ -78,11 +83,16 @@ class Snitch:
             cursor.execute(create_table)
             cursor.execute(create_meta)
             self._migrate(cursor)
-            # First writer wins: preserve the identity the log was created with
-            # even if a later run supplies a different name for the same file.
+            # First writer wins: preserve the identity and code fingerprint the
+            # log was created with, even if a later run supplies different ones
+            # for the same file.
             cursor.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('student', ?)",
                 (self.student,),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('code_hash', ?)",
+                (self.code_hash,),
             )
             conn.commit()
         finally:
@@ -99,10 +109,21 @@ class Snitch:
         return slug or "anon"
 
     @staticmethod
-    def _root(student):
-        # Chain anchor derived from the student's name (replaces the generic
-        # GENESIS seed). Empty name still yields a stable, name-bound root.
-        seed = "fda_snitch:" + (student or "").strip()
+    def _hash_source():
+        # SHA-256 of this module's own source. Returns "" if unreadable so a
+        # start-up hiccup never stops monitoring.
+        try:
+            with open(Path(__file__).resolve(), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _root(student, code_hash):
+        # Chain anchor derived from the student's name and the code fingerprint
+        # (replaces the generic GENESIS seed). Empty values still yield a stable,
+        # bound root.
+        seed = "fda_snitch:" + (student or "").strip() + ":" + (code_hash or "")
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _connect_db(self):
@@ -186,31 +207,36 @@ class Snitch:
             user32.CloseClipboard()
 
     @classmethod
-    def verify(cls, database_path, student=None):
+    def verify(cls, database_path, student=None, expected_code_hash=None):
         """Walk the hash chain in a log database and report the first break.
 
-        Pass ``student`` to assert whose log this should be: the chain is then
-        re-rooted from that name, so a log swapped in from another student (or
-        stripped of its identity) fails at the very first row.
+        Pass ``student`` to assert whose log this should be, and/or
+        ``expected_code_hash`` to assert which code produced it: the chain is
+        re-rooted from those values, so a log swapped in from another student,
+        stripped of its identity, or produced by modified code fails at the
+        very first row.
 
         Returns a dict:
-            ok      -- True only if the chain is intact and seqs are contiguous
-            rows    -- number of chained rows checked
-            error   -- None, or a human-readable description of the first problem
-            seq     -- seq of the first problem row (None if ok)
-            gaps    -- list of missing seq numbers (i.e. deleted rows)
-            student -- the name stored in the log (None for legacy logs)
+            ok        -- True only if the chain is intact and seqs are contiguous
+            rows      -- number of chained rows checked
+            error     -- None, or a description of the first problem
+            seq       -- seq of the first problem row (None if ok)
+            gaps      -- list of missing seq numbers (i.e. deleted rows)
+            student   -- the name stored in the log (None for legacy logs)
+            code_hash -- the code fingerprint stored in the log (None if absent)
         """
         conn = sqlite3.connect(database_path)
         try:
-            stored = None
+            stored, stored_code = None, None
             try:
-                r = conn.execute(
-                    "SELECT value FROM meta WHERE key='student'"
-                ).fetchone()
-                stored = r[0] if r else None
+                meta = dict(conn.execute(
+                    "SELECT key, value FROM meta "
+                    "WHERE key IN ('student', 'code_hash')"
+                ).fetchall())
+                stored = meta.get('student')
+                stored_code = meta.get('code_hash')
             except sqlite3.OperationalError:
-                stored = None  # legacy log without a meta table
+                pass  # legacy log without a meta table
             rows = conn.execute(
                 "SELECT seq, timestamp, connected, hash, clip_hash, clip_len, "
                 "prev_chain, chain FROM logs WHERE seq IS NOT NULL ORDER BY id"
@@ -218,8 +244,8 @@ class Snitch:
         finally:
             conn.close()
 
-        result = {"ok": False, "rows": len(rows), "error": None,
-                  "seq": None, "gaps": [], "student": stored}
+        result = {"ok": False, "rows": len(rows), "error": None, "seq": None,
+                  "gaps": [], "student": stored, "code_hash": stored_code}
 
         # Caller asserted a name that disagrees with the log's own record.
         if (student is not None and stored is not None
@@ -228,10 +254,21 @@ class Snitch:
                                f"expected {student!r}")
             return result
 
-        # Which identity roots the chain? Prefer the asserted name, then the
-        # stored one; fall back to the generic seed for pre-identity logs.
+        # Caller asserted a code fingerprint that disagrees with the log's.
+        if (expected_code_hash is not None and stored_code is not None
+                and expected_code_hash != stored_code):
+            result["error"] = (f"code mismatch: log was produced by "
+                               f"{stored_code!r}, expected {expected_code_hash!r}")
+            return result
+
+        # Which identity/code root the chain? Prefer the asserted values, then
+        # the stored ones; fall back to the generic seed for pre-identity logs.
         identity = student if student is not None else stored
-        root = cls._root(identity) if identity is not None else GENESIS
+        code = expected_code_hash if expected_code_hash is not None else stored_code
+        if identity is not None or code is not None:
+            root = cls._root(identity, code)
+        else:
+            root = GENESIS
 
         if not rows:
             result["error"] = "no chained rows found (empty or pre-chain log)"
@@ -281,6 +318,18 @@ class Snitch:
             return row[0], row[1] or self.root
         return 0, self.root
 
+    def _last_clip_hash(self, cursor):
+        # Seed clipboard-change detection from the last recorded clip so a
+        # restart doesn't re-log a clipboard that hasn't actually changed.
+        try:
+            row = cursor.execute(
+                "SELECT clip_hash FROM logs "
+                "WHERE clip_hash IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        return row[0] if row else None
+
     def _ping(self):
         try:
             socket.create_connection((self.url, 80), timeout=5)
@@ -299,7 +348,8 @@ class Snitch:
         conn, cursor = self._connect_db()
         seq, prev_chain = self._load_chain_state(cursor)
         last_ping = None
-        last_clip_hash = None
+        last_clip_hash = self._last_clip_hash(cursor)
+        failures = 0
 
         while(True):
 
@@ -310,12 +360,12 @@ class Snitch:
             try:
                 next_seq = seq + 1
 
-                # create hash of file
-                with open(Path(__file__).resolve(), "rb") as f:
-                    src_hash = hashlib.sha256(f.read()).hexdigest()
+                # code fingerprint is constant for the run (computed at start-up)
+                src_hash = self.code_hash
 
-                # current timestamp (stored and hashed as the same string)
-                now = datetime.now().isoformat()
+                # current timestamp in UTC, stored and hashed as the same string,
+                # so DST/clock changes can't reorder it
+                now = datetime.now(timezone.utc).isoformat()
 
                 # try to reach out to google.nl
                 connected = self._ping()
@@ -325,10 +375,10 @@ class Snitch:
 
                 if connected != last_ping and self.with_sound:
                     try:
-                        # beep twice
+                        # beep twice; a sound glitch must never stop us logging
                         self.beep()
                         self.beep()
-                    finally:
+                    except Exception:
                         pass
 
                 # reset
@@ -368,7 +418,19 @@ class Snitch:
                 # only advance once the row is safely committed
                 seq = next_seq
                 prev_chain = chain
-            except Exception:
-                pass
+                failures = 0
+            except Exception as e:
+                # Surface the problem instead of stalling silently, roll back any
+                # half-open transaction, and back off so a permanent failure does
+                # not spin (or spam) at full speed.
+                failures += 1
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print(f"[fda_snitch] iteration failed ({failures}x): {e!r}")
 
-            time.sleep(self.sleep)
+            if failures:
+                time.sleep(max(1, min(self.sleep * failures, 30)))
+            else:
+                time.sleep(self.sleep)
