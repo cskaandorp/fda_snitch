@@ -6,6 +6,7 @@ import re
 import sqlite3
 import socket
 import subprocess
+import threading
 import time
 import unicodedata
 from datetime import datetime, timezone
@@ -63,6 +64,9 @@ class Snitch:
         if secret is None:
             secret = os.environ.get("FDA_SNITCH_KEY")
         self.secret = secret.encode("utf-8") if isinstance(secret, str) else secret
+
+        # Set by stop() to end the run_snitch() loop cleanly (see stop()).
+        self._stop = threading.Event()
 
         # Ask who is being monitored before anything starts. Blank -> "anon",
         # so a skipped prompt never stops the exam from beginning.
@@ -410,6 +414,13 @@ class Snitch:
         elif platform.system() == 'Darwin':  # macOS
             os.system('afplay /System/Library/Sounds/Ping.aiff')
 
+    def stop(self):
+        # Signal run_snitch() to finish its current tick and exit cleanly. Safe
+        # to call from another thread (e.g. a notebook cell while the loop runs
+        # in a background thread). The loop wakes immediately rather than waiting
+        # out the remaining sleep.
+        self._stop.set()
+
     def run_snitch(self):
         conn, cursor = self._connect_db()
         seq, prev_chain = self._load_chain_state(cursor)
@@ -417,7 +428,8 @@ class Snitch:
         last_clip_hash = self._last_clip_hash(cursor)
         failures = 0
 
-        while(True):
+        self._stop.clear()  # allow a fresh run after a previous stop()
+        while not self._stop.is_set():
 
             # A monitor that dies is worse than one that skips a beat, so a
             # transient failure (db lock, disk hiccup, network stack error)
@@ -496,7 +508,15 @@ class Snitch:
                     pass
                 print(f"[fda_snitch] iteration failed ({failures}x): {e!r}")
 
+            # Sleep until the next tick, but wake immediately if stop() is
+            # called during the wait rather than lingering up to `sleep` seconds.
             if failures:
-                time.sleep(max(1, min(self.sleep * failures, 30)))
+                self._stop.wait(max(1, min(self.sleep * failures, 30)))
             else:
-                time.sleep(self.sleep)
+                self._stop.wait(self.sleep)
+
+        # Loop ended via stop(): release the database connection.
+        try:
+            conn.close()
+        except Exception:
+            pass
