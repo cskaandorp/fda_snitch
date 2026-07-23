@@ -7,6 +7,7 @@ import sqlite3
 import socket
 import subprocess
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -122,8 +123,14 @@ class Snitch:
 
     @staticmethod
     def _slug(name):
-        # Filesystem-safe, lower-case handle for the database filename.
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", (name or "").strip()).strip("_").lower()
+        # Filesystem-safe, lower-case handle for the database filename. Accented
+        # Latin letters are folded to ASCII (José -> jose, Núñez -> nunez) so
+        # European names stay readable; names with no usable Latin letters fall
+        # back to "anon". The identity binding uses the full name regardless, so
+        # this only affects the filename.
+        decomposed = unicodedata.normalize("NFKD", (name or "").strip())
+        ascii_name = decomposed.encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", ascii_name).strip("_").lower()
         return slug or "anon"
 
     @staticmethod
